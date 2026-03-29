@@ -110,6 +110,9 @@ playBtn.addEventListener('click', () => {
             splatters = [];
             isFadingOut = false;
             fadeAlpha = 0;
+            lastBeatTime = performance.now();
+            lastRandomSplashTime = performance.now();
+            nextRandomSplashDelay = 8000 + Math.random() * 4000;
             if (mediaRecorder.state !== 'recording') {
                 mediaRecorder.start();
             }
@@ -163,7 +166,7 @@ function getBendOffset(depth) {
 class Splatter {
     constructor() {
         this.angle = Math.random() * Math.PI * 2;
-        this.depth = 0.01; 
+        this.depth = 0.15; // Start past the center fog so they're immediately visible
         this.size = Math.random() * 8 + 5;
         this.color = COLORS[Math.floor(Math.random() * COLORS.length)];
         
@@ -185,7 +188,9 @@ class Splatter {
     }
 
     update(speed, globalRotation) {
-        this.depth *= speed;
+        // Guarantee a minimum expansion speed so splatters are always visibly moving
+        let effectiveSpeed = Math.max(speed, 1.02);
+        this.depth *= effectiveSpeed;
         this.dripLength += this.dripSpeed * (this.depth * 0.08);
         return this.depth > 7; 
     }
@@ -282,6 +287,8 @@ class TunnelRing {
 }
 
 let lastBeatTime = 0;
+let lastRandomSplashTime = 0;
+let nextRandomSplashDelay = 8000 + Math.random() * 4000;
 let globalRotation = 0;
 
 function renderLoop() {
@@ -322,10 +329,30 @@ function renderLoop() {
             rings.push(new TunnelRing(isBeat));
         }
 
-        if (isBeat && performance.now() - lastBeatTime > 150) {
-            let numSplats = Math.floor(Math.random() * 4) + 1; 
+        let timeSinceLastSplat = performance.now() - lastBeatTime;
+        let timeSinceLastRandom = performance.now() - lastRandomSplashTime;
+
+        // 1. Unconditional Random Splash (Every 8-12 seconds)
+        if (timeSinceLastRandom > nextRandomSplashDelay) {
+            let numSplats = Math.floor(Math.random() * 5) + 6; // 6 to 10 drops
+            for (let i = 0; i < numSplats; i++) {
+                let s = new Splatter();
+                s.size *= 1.5;
+                splatters.push(s); 
+            }
+            lastRandomSplashTime = performance.now();
+            nextRandomSplashDelay = 8000 + Math.random() * 4000; // 8 to 12s
+        }
+
+        // 2. Audio-Responsive Splash (Rate-limited to 150ms)
+        if (isBeat && timeSinceLastSplat > 150) {
+            let numSplats = Math.floor(Math.random() * 5) + 4; 
             if (Math.random() < 0.15) numSplats += 15; 
-            for (let i = 0; i < numSplats; i++) splatters.push(new Splatter());
+            for (let i = 0; i < numSplats; i++) {
+                let s = new Splatter();
+                s.size *= 1.2; 
+                splatters.push(s);
+            }
             lastBeatTime = performance.now();
         }
     }
