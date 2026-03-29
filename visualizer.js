@@ -6,6 +6,13 @@ const ctx = canvas.getContext('2d');
 
 let audioCtx, analyser, source, dataArray;
 let isPlaying = false;
+let isStarted = false;
+
+// Recording state
+let mediaRecorder;
+let recordedChunks = [];
+let isFadingOut = false;
+let fadeAlpha = 0;
 
 // Visualizer State
 let time = 0;
@@ -34,8 +41,50 @@ playBtn.addEventListener('click', () => {
         dataArray = new Uint8Array(bufferLength);
         
         source = audioCtx.createMediaElementSource(audioElement);
+        
+        // Create audio stream destination for recording
+        const audioStreamDestination = audioCtx.createMediaStreamDestination();
         source.connect(analyser);
-        analyser.connect(audioCtx.destination);
+        source.connect(audioStreamDestination); // direct audio to recorder
+        analyser.connect(audioCtx.destination); // direct audio to speakers
+        
+        // Initialize MediaRecorder combining video (canvas) and audio streams
+        const videoStream = canvas.captureStream(60); // 60 FPS
+        const combinedStream = new MediaStream([
+            ...videoStream.getVideoTracks(), 
+            ...audioStreamDestination.stream.getAudioTracks()
+        ]);
+        
+        // Try VP9 first, fallback to VP8 or default
+        let mimeType = 'video/webm;codecs=vp9,opus';
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+            mimeType = 'video/webm;codecs=vp8,opus';
+            if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm';
+        }
+
+        mediaRecorder = new MediaRecorder(combinedStream, { mimeType: mimeType });
+        
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+                recordedChunks.push(event.data);
+            }
+        };
+
+        mediaRecorder.onstop = () => {
+            const blob = new Blob(recordedChunks, { type: 'video/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            document.body.appendChild(a);
+            a.style = 'display: none';
+            a.href = url;
+            a.download = 'SurrenderingHisAuthority_Visualizer.webm';
+            a.click();
+            window.URL.revokeObjectURL(url);
+            
+            // Re-show UI after recording completes
+            uiContainer.style.opacity = '1';
+            playBtn.innerText = 'Play Again';
+        };
     }
     
     if (audioCtx.state === 'suspended') {
@@ -46,14 +95,45 @@ playBtn.addEventListener('click', () => {
         audioElement.pause();
         playBtn.innerText = 'Play / Pause';
         uiContainer.style.opacity = '1';
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+            mediaRecorder.pause();
+        }
     } else {
         audioElement.play();
         playBtn.innerText = 'Pause Visualizer';
         uiContainer.style.opacity = '0';
+        
+        // Reset recording and visualizer state if we're starting fresh
+        if (audioElement.currentTime === 0 || isFadingOut) {
+            recordedChunks = [];
+            rings = [];
+            splatters = [];
+            isFadingOut = false;
+            fadeAlpha = 0;
+            if (mediaRecorder.state !== 'recording') {
+                mediaRecorder.start();
+            }
+        } else if (mediaRecorder && mediaRecorder.state === 'paused') {
+            mediaRecorder.resume();
+        }
+        
         requestAnimationFrame(renderLoop);
     }
     
     isPlaying = !isPlaying;
+});
+
+// Trigger fade out and stop recording when the song finishes
+audioElement.addEventListener('ended', () => {
+    isFadingOut = true;
+    
+    // Give it 3.5 seconds to fully fade to black, then stop the recorder
+    setTimeout(() => {
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
+        }
+        isPlaying = false;
+    }, 3500);
 });
 
 // Helper: detect beats
@@ -62,7 +142,6 @@ function detectBeat(bassValue) {
     if (bassHistory.length > 30) bassHistory.shift();
     
     let avg = bassHistory.reduce((a, b) => a + b, 0) / bassHistory.length;
-    // Lowered threshold slightly to trigger more often
     if (bassValue > avg * 1.2 && bassValue > 130) {
         return true;
     }
@@ -71,11 +150,7 @@ function detectBeat(bassValue) {
 
 // Calculate the bending curve based on depth
 function getBendOffset(depth) {
-    // Math.log(depth) creates a smooth perspective curve
-    // It makes the curve tighten the further away it is
     let curveTime = time * 0.5 + (Math.log(Math.max(0.001, depth)) * 2);
-    
-    // Scale curve amplitude by depth so it's subtle near camera and extreme far away
     let bendAmp = Math.min(600, 300 / depth); 
     
     return {
@@ -89,16 +164,13 @@ class Splatter {
     constructor() {
         this.angle = Math.random() * Math.PI * 2;
         this.depth = 0.01; 
-        this.size = Math.random() * 8 + 5; // Slightly larger base size
+        this.size = Math.random() * 8 + 5;
         this.color = COLORS[Math.floor(Math.random() * COLORS.length)];
         
-        // Offset from the exact center of the ring
         this.offsetX = (Math.random() - 0.5) * 60;
         this.offsetY = (Math.random() - 0.5) * 60;
 
-        // Drip simulation
         this.dripLength = 0;
-        // Make gravity more intense for dynamic effect
         this.dripSpeed = Math.random() * 4 + 2;
 
         this.drops = [];
@@ -115,14 +187,13 @@ class Splatter {
     update(speed, globalRotation) {
         this.depth *= speed;
         this.dripLength += this.dripSpeed * (this.depth * 0.08);
-        return this.depth > 7; // Give it more time to clear camera
+        return this.depth > 7; 
     }
 
     draw(ctx, cx, cy, globalRotation) {
         let radius = this.depth * Math.min(canvas.width, canvas.height); 
         let finalAngle = this.angle + globalRotation;
         
-        // Add tunnel bending offsets
         let bend = getBendOffset(this.depth);
 
         let x = cx + bend.ox + Math.cos(finalAngle) * radius + (this.offsetX * this.depth * 10);
@@ -143,7 +214,6 @@ class Splatter {
             if (drop.ds > 0.5) { 
                 ctx.beginPath();
                 ctx.moveTo(px - pSize/2, py);
-                // Drip bends straight down regardless of rotation (simulating gravity)
                 ctx.quadraticCurveTo(px, py + pSize + (this.dripLength * drop.ds), px + pSize/2, py);
                 ctx.fill();
             }
@@ -180,10 +250,32 @@ class TunnelRing {
 
         let alpha = Math.min(1, this.depth * 5) * Math.max(0, 1 - (this.depth * 0.12));
         
-        ctx.strokeStyle = this.isBeat 
-            ? `rgba(255, 255, 255, ${alpha})` 
-            : `rgba(130, 130, 180, ${alpha * 0.3 * intensity})`;
+        // Dynamic Lighting: Calculate the angle of the current bend
+        let turnAngle = Math.atan2(bend.oy, bend.ox);
         
+        // Create a gradient across the ring pointing precisely into the turn
+        let x1 = cx + bend.ox - Math.cos(turnAngle) * radius;
+        let y1 = cy + bend.oy - Math.sin(turnAngle) * radius;
+        let x2 = cx + bend.ox + Math.cos(turnAngle) * radius;
+        let y2 = cy + bend.oy + Math.sin(turnAngle) * radius;
+
+        let grad = ctx.createLinearGradient(x1, y1, x2, y2);
+        
+        if (this.isBeat) {
+            // Darker on trailing side, extremely bright on turning side
+            grad.addColorStop(0, `rgba(100, 100, 100, ${alpha * 0.4})`); 
+            grad.addColorStop(1, `rgba(255, 255, 255, ${alpha})`); 
+        } else {
+            // Create a minimum floor for visibility so they never vanish completely
+            // It scales up with intensity but never drops below 40% of its potential
+            let baseAlpha = alpha * Math.max(0.4, intensity * 1.5);
+            
+            // Deep blue on trailing side, glowing blue on turning side
+            grad.addColorStop(0, `rgba(60, 60, 120, ${baseAlpha * 0.3})`);
+            grad.addColorStop(1, `rgba(180, 180, 255, ${baseAlpha})`);
+        }
+        
+        ctx.strokeStyle = grad;
         ctx.lineWidth = this.isBeat ? this.depth * 6 : this.depth * 1.5;
         ctx.stroke();
     }
@@ -196,13 +288,12 @@ function renderLoop() {
     if (!isPlaying) return;
     requestAnimationFrame(renderLoop);
     
-    // Smooth motion blur background
-    ctx.fillStyle = 'rgba(5, 5, 10, 0.4)'; 
+    // Smooth motion blur background - reduced opacity so lines linger longer and build brighter webs
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)'; 
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     
     analyser.getByteFrequencyData(dataArray);
     
-    // Calculate Bass and Mid range
     let bass = 0;
     for (let i = 0; i < 5; i++) bass += dataArray[i];
     bass /= 5;
@@ -211,47 +302,41 @@ function renderLoop() {
     for (let i = 10; i < 30; i++) mid += dataArray[i];
     mid /= 20;
 
-    let intensity = mid / 255;
+    let intensityRaw = mid / 255;
+    let intensity = Math.pow(intensityRaw, 2.5);
+    
+    let bassRaw = bass / 255;
+    let curvedBass = Math.pow(bassRaw, 3.0); 
+
     let isBeat = detectBeat(bass);
     
     time += 0.01 + (intensity * 0.015);
-    // Tunnel rotates continually
-    globalRotation += 0.003 + (intensity * 0.005);
+    globalRotation += 0.002 + (intensity * 0.006);
     
     let cx = canvas.width / 2;
     let cy = canvas.height / 2;
 
-    // Constantly spawn Tunnel Rings for dense wall feel
-    if (Math.random() < 0.4 + (intensity * 0.4)) {
-        rings.push(new TunnelRing(isBeat));
-    }
-
-    // Spawn Splatters
-    // If it's a beat and a slight cooldown has passed
-    if (isBeat && performance.now() - lastBeatTime > 150) {
-        
-        let numSplats = Math.floor(Math.random() * 4) + 1; // 1-4 standard splats
-        
-        // ~15% chance to do a massive "super splash" of paint down the hole
-        if (Math.random() < 0.15) {
-            numSplats += 15; // Mega burst
+    // Only spawn new elements if we aren't fading out
+    if (!isFadingOut) {
+        if (Math.random() < 0.2 + (intensity * 0.6)) {
+            rings.push(new TunnelRing(isBeat));
         }
 
-        for (let i = 0; i < numSplats; i++) {
-            splatters.push(new Splatter());
+        if (isBeat && performance.now() - lastBeatTime > 150) {
+            let numSplats = Math.floor(Math.random() * 4) + 1; 
+            if (Math.random() < 0.15) numSplats += 15; 
+            for (let i = 0; i < numSplats; i++) splatters.push(new Splatter());
+            lastBeatTime = performance.now();
         }
-        lastBeatTime = performance.now();
     }
 
-    // Tunnel speed increases with bass
-    let speed = 1.012 + (bass / 255) * 0.025;
+    let speed = 1.008 + (curvedBass * 0.035);
 
-    // Pre-calculate closest bend center to draw a clean center "fog" 
     let farBend = getBendOffset(0.01);
     let centerFogX = cx + farBend.ox;
     let centerFogY = cy + farBend.oy;
 
-    // Update & Draw Rings (drawn back to front naturally by depth)
+    // Update & Draw Rings
     for (let i = rings.length - 1; i >= 0; i--) {
         let ring = rings[i];
         if (ring.update(speed)) {
@@ -261,7 +346,7 @@ function renderLoop() {
         }
     }
 
-    // Update & Draw Splatters (paint sits on the walls)
+    // Update & Draw Splatters
     for (let i = splatters.length - 1; i >= 0; i--) {
         let splat = splatters[i];
         if (splat.update(speed, globalRotation)) {
@@ -271,11 +356,18 @@ function renderLoop() {
         }
     }
     
-    // Draw fog at the very back of the bending tunnel to hide pop-in perfectly
+    // Draw center fog as pure black to create a bottomless pit
     let gradient = ctx.createRadialGradient(centerFogX, centerFogY, 0, centerFogX, centerFogY, 150);
-    gradient.addColorStop(0, 'rgba(5, 5, 10, 1)');
-    gradient.addColorStop(0.3, 'rgba(5, 5, 10, 0.9)');
-    gradient.addColorStop(1, 'rgba(5, 5, 10, 0)');
+    gradient.addColorStop(0, 'rgba(0, 0, 0, 1)');
+    gradient.addColorStop(0.4, 'rgba(0, 0, 0, 0.9)');
+    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Fade to Black overlay at the end of the song
+    if (isFadingOut) {
+        fadeAlpha += 0.005; 
+        ctx.fillStyle = `rgba(0, 0, 0, ${Math.min(1, fadeAlpha)})`;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
 }
